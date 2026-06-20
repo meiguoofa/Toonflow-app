@@ -17,16 +17,9 @@ export default router.post(
     const { scriptId, page, limit, name } = req.body;
     const offset = (page - 1) * limit;
 
-    const storyboardData = await u
-      .db("o_storyboard")
-      .where({ scriptId })
-      .modify((qb) => {
-        if (name) {
-          qb.andWhere("title", "like", `%${name}%`);
-        }
-      })
-      .offset(offset)
-      .limit(limit);
+    let dataQuery: any = u.db("o_storyboard").where({ scriptId });
+    if (name) dataQuery = dataQuery.andWhere("title", "like", `%${name}%`);
+    const storyboardData = await dataQuery.offset(offset).limit(limit);
     const data = await Promise.all(
       storyboardData.map(async (i: any) => {
         return {
@@ -37,16 +30,9 @@ export default router.post(
         };
       }),
     );
-    const totalQuery = (await u
-      .db("o_storyboard")
-      .where({ scriptId })
-      .modify((qb) => {
-        if (name) {
-          qb.andWhere("title", "like", `%${name}%`);
-        }
-      })
-      .count("* as total")
-      .first()) as any;
+    let countQuery: any = u.db("o_storyboard").where({ scriptId });
+    if (name) countQuery = countQuery.andWhere("title", "like", `%${name}%`);
+    const totalQuery = (await countQuery.count("* as total").first()) as any;
 
     res.status(200).send(success({ data: data, total: totalQuery?.total }));
   },

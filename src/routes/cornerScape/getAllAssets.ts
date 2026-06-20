@@ -13,7 +13,7 @@ export default router.post(
   }),
   async (req, res) => {
     const { projectId, type } = req.body;
-    const data = await u
+    let assetsQuery: any = u
       .db("o_assets")
       .leftJoin("o_image", "o_assets.imageId", "o_image.id")
       .select(
@@ -28,11 +28,11 @@ export default router.post(
       .where("o_assets.projectId", projectId)
       .andWhere("o_assets.type", "<>", "clip")
       .andWhere("o_assets.type", "<>", "audio")
-      .andWhere("o_assets.assetsId", null)
-      .modify((qb) => {
-        if (type && type.length > 0) qb.whereIn("o_assets.type", type);
-      })
-      .orderByRaw(`CASE o_assets.type WHEN 'role' THEN 1 WHEN 'scene' THEN 2 WHEN 'tool' THEN 3 ELSE 4 END`);
+      .andWhere("o_assets.assetsId", null);
+    if (type && type.length > 0) assetsQuery = assetsQuery.whereIn("o_assets.type", type);
+    const dataRaw = await assetsQuery;
+    const typeOrder: Record<string, number> = { role: 1, scene: 2, tool: 3 };
+    const data = (dataRaw as any[]).slice().sort((a, b) => (typeOrder[a.type] ?? 4) - (typeOrder[b.type] ?? 4));
     const assets2AudioData = await u
       .db("o_assetsRole2Audio")
       .leftJoin("o_assets", "o_assets.id", "o_assetsRole2Audio.assetsAudioId")

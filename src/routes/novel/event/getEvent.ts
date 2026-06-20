@@ -1,6 +1,5 @@
 import express from "express";
 import u from "@/utils";
-import { db } from "@/utils/db";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
@@ -18,40 +17,66 @@ export default router.post(
     const { projectId, page, limit, search } = req.body;
     const offset = (page - 1) * limit;
 
-    // 构造基础查询：通过 o_eventChapter -> o_novel 过滤 projectId，再 join o_event 取名称和内容
-    const baseQuery = u
-      .db("o_event as e")
-      .join("o_eventChapter as ec", "ec.eventId", "e.id")
-      .join("o_novel as n", "n.id", "ec.novelId")
-      .where("n.projectId", projectId);
-
-    if (search) {
-      baseQuery.where("e.name", "like", `%${search}%`);
-    }
-
-    // 统计去重后的事件总数
-    const [{ total }] = await baseQuery.clone().countDistinct("e.id as total");
-
-    if (!Number(total)) {
+    const novelRows: { id: number; chapterIndex: number }[] = await u
+      .db("o_novel")
+      .where("projectId", projectId)
+      .select("id", "chapterIndex");
+    if (novelRows.length === 0) {
       return res.status(200).send(success({ list: [], total: 0 }));
     }
+    const novelIds = novelRows.map((r) => r.id);
+    const novelChapterMap = new Map(novelRows.map((r) => [r.id, r.chapterIndex]));
 
-    // 分页查询：每个事件对应多个 chapterIndex，用 GROUP_CONCAT 聚合
-    const rows = await baseQuery
-      .clone()
-      .select("e.id", "e.name as eventName", "e.detail", "e.createTime", db.raw("GROUP_CONCAT(n.chapterIndex) as chapterIndexes"))
-      .groupBy("e.id")
-      .limit(limit)
-      .offset(offset);
+    let eventIdFilter: number[] | null = null;
+    if (search) {
+      const searched: { id: number }[] = await u.db("o_event").where("name", "like", `%${search}%`).select("id");
+      eventIdFilter = searched.map((r) => r.id);
+      if (eventIdFilter.length === 0) {
+        return res.status(200).send(success({ list: [], total: 0 }));
+      }
+    }
 
-    const list = rows.map((e: { id: number; eventName: string; detail: string; createTime: number; chapterIndexes: string | null }) => ({
-      id: e.id,
-      eventName: e.eventName,
-      detail: e.detail,
-      createTime: e.createTime,
-      chapters: e.chapterIndexes ? e.chapterIndexes.split(",").map(Number) : [],
-    }));
+    let ecQuery: any = u.db("o_eventChapter").whereIn("novelId", novelIds);
+    if (eventIdFilter) ecQuery = ecQuery.whereIn("eventId", eventIdFilter);
+    const ec: { eventId: number; novelId: number }[] = await ecQuery.orderBy("eventId").select("eventId", "novelId");
 
-    res.status(200).send(success({ list, total: Number(total) }));
+    const eventToNovelIds = new Map<number, number[]>();
+    for (const { eventId, novelId } of ec) {
+      const arr = eventToNovelIds.get(eventId);
+      if (arr) arr.push(novelId);
+      else eventToNovelIds.set(eventId, [novelId]);
+    }
+
+    const total = eventToNovelIds.size;
+    const allEventIds = Array.from(eventToNovelIds.keys());
+    const pageEventIds = allEventIds.slice(offset, offset + limit);
+    if (pageEventIds.length === 0) {
+      return res.status(200).send(success({ list: [], total }));
+    }
+
+    const events: { id: number; name: string; detail: string; createTime: number }[] = await u
+      .db("o_event")
+      .whereIn("id", pageEventIds)
+      .select("id", "name", "detail", "createTime");
+    const eventMap = new Map(events.map((e) => [e.id, e]));
+
+    const list = pageEventIds
+      .map((id) => {
+        const e = eventMap.get(id);
+        if (!e) return null;
+        const chapters = (eventToNovelIds.get(id) || [])
+          .map((nid) => novelChapterMap.get(nid))
+          .filter((x): x is number => x !== undefined);
+        return {
+          id: e.id,
+          eventName: e.name,
+          detail: e.detail,
+          createTime: e.createTime,
+          chapters,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+
+    res.status(200).send(success({ list, total }));
   },
 );

@@ -1,210 +1,214 @@
-import isPathInside from "is-path-inside";
-import getPath, { isEletron } from "@/utils/getPath";
-import fs from "node:fs/promises";
 import path from "node:path";
-import sharp from "sharp";
+import { isEletron } from "@/utils/getPath";
 
-// 规范化路径：去除前导斜杠，并将路径分隔符统一转换为系统分隔符
-function normalizeUserPath(userPath: string): string {
-  // 去除前导的 / 或 \
-  const trimmedPath = userPath.replace(/^[/\\]+/, "");
-  // 将所有 / 替换为系统路径分隔符（path.sep）
-  // 这样在 Windows 上会转为 \，在 Unix 上保持 /
-  return trimmedPath.split("/").join(path.sep);
+// =============================================================================
+// TOS 适配版 OSS 客户端。
+//
+// 与原本地实现保持完全相同的公共 API（getFileUrl / writeFile / getFile /
+// getImageBase64 / deleteFile / deleteDirectory / fileExists / getSmallImageUrl），
+// 让上游 80+ 处调用零改动。
+//
+// 核心策略：
+//   - writeFile  →  POST /api/tos/sign?op=put → fetch PUT TOS
+//   - getFileUrl →  POST /api/tos/sign?op=get（带 60s 内存缓存）
+//   - getFile / getImageBase64 → 通过 GET URL 拉取
+//   - deleteFile / deleteDirectory → POST /api/tos/sign?op=delete|deletePrefix
+//
+// prefix 兼容：
+//   - 默认 prefix=oss   → 走 TOS（key 直接是 normalized path）
+//   - prefix=skills/assets → 仍走桌面端本地静态服务（应用内置资源，未上 TOS）
+//
+// key 规范：保持现有 `{projectId}/assets/{uuid}.ext` 等结构，去掉前导 `/`。
+// 详见 Toonflow-Backend/docs/tos-migration.md。
+// =============================================================================
+
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
+
+// ---- token：复用 db.ts 同源约定 ---------------------------------------------
+let _runtimeToken: string | null = null;
+export function setToken(token: string | null) {
+  _runtimeToken = token;
+}
+function getStoredToken(): string {
+  return _runtimeToken || process.env.TOONFLOW_TOKEN || "";
 }
 
-// 校验路径
-function resolveSafeLocalPath(userPath: string, rootDir: string): string {
-  const safePath = normalizeUserPath(userPath);
-  const absPath = path.join(rootDir, safePath);
-  if (!isPathInside(absPath, rootDir)) {
-    throw new Error(`${userPath} 不在 OSS 根目录内`);
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...(extra || {}) };
+  const token = getStoredToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+
+// ---- key 规范化（去前导 /，统一 posix 分隔符） ------------------------------
+function toKey(userPath: string): string {
+  if (!userPath) return "";
+  return userPath.replace(/^[/\\]+/, "").split(path.sep).join("/").split("\\").join("/");
+}
+
+// ---- 后端签名调用 ----------------------------------------------------------
+async function callSign(body: Record<string, any>): Promise<any> {
+  const res = await fetch(`${BACKEND_URL}/api/tos/sign`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  let json: any;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error(`[oss] invalid JSON from /api/tos/sign (status ${res.status})`);
   }
-  return absPath;
+  if (!json || json.code !== 0) {
+    throw new Error(`[oss] /api/tos/sign failed: ${json?.code} ${json?.message}`);
+  }
+  return json.data;
+}
+
+// ---- GET URL 60s 内存缓存 ---------------------------------------------------
+const SIGN_TTL = 60 * 1000;
+const getUrlCache = new Map<string, { url: string; expireAt: number }>();
+
+async function signedGet(key: string): Promise<string> {
+  const now = Date.now();
+  const hit = getUrlCache.get(key);
+  if (hit && hit.expireAt > now) return hit.url;
+  const data = await callSign({ op: "get", key, expires: 3600 });
+  // 比签名实际时长短一点缓存，避免边界过期
+  getUrlCache.set(key, { url: data.url, expireAt: now + SIGN_TTL });
+  return data.url;
+}
+
+// 简陋 mime 推断（仅用于 PUT contentType）
+const EXT_MIME: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".tiff": "image/tiff",
+  ".tif": "image/tiff",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+};
+function guessContentType(p: string): string | undefined {
+  const ext = path.extname(p).toLowerCase();
+  return EXT_MIME[ext];
 }
 
 class OSS {
-  private rootDir: string;
-  private initPromise: Promise<void>;
-
-  constructor() {
-    this.rootDir = getPath("oss");
-    // 初始化时自动创建根目录
-    this.initPromise = fs.mkdir(this.rootDir, { recursive: true }).then(() => {});
-  }
-
-  /**
-   * 等待根目录初始化完成。用于保证所有文件操作在目录已创建后执行。
-   * @private
-   */
-  private async ensureInit() {
-    await this.initPromise;
-  }
-
   /**
    * 获取指定相对路径文件的访问 URL。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @returns 文件的 http 链接（本地服务地址）
+   *
+   * 默认 prefix=oss → TOS 签名 GET URL。
+   * prefix=skills/assets → 仍指向桌面端本地静态目录（应用内置资源）。
    */
   async getFileUrl(userRelPath: string, prefix?: string): Promise<string> {
-    if (!prefix) prefix = "oss";
-    await this.ensureInit();
-    const safePath = normalizeUserPath(userRelPath);
-    // URL 始终使用 /，所以这里需要将系统分隔符转回 /
-    let url = `/${prefix}/`;
-    if (process.env.ossURL && process.env.ossURL !== "") url = process.env.ossURL + `/${prefix}/`;
-    if (process.env.NODE_ENV == "dev") url = `http://localhost:10588/${prefix}/`;
-    if (isEletron()) url = `http://localhost:${process.env.PORT}/${prefix}/`;
-    return `${url}${safePath.split(path.sep).join("/")}`;
+    if (prefix && prefix !== "oss") {
+      // 非 TOS 内容（应用内置 skills/assets），保留原本地静态地址逻辑
+      const key = toKey(userRelPath);
+      let base = `/${prefix}/`;
+      if (process.env.ossURL && process.env.ossURL !== "") base = process.env.ossURL + `/${prefix}/`;
+      if (process.env.NODE_ENV == "dev") base = `http://localhost:10588/${prefix}/`;
+      if (isEletron()) base = `http://localhost:${process.env.PORT}/${prefix}/`;
+      return `${base}${key}`;
+    }
+    return signedGet(toKey(userRelPath));
   }
 
-  /**
-   * 读取指定路径的文件内容为 Buffer。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @returns 文件内容的 Buffer
-   * @throws 路径不在 OSS 根目录内、文件不存在等错误
-   */
+  /** 读取 TOS 对象为 Buffer。 */
   async getFile(userRelPath: string): Promise<Buffer> {
-    await this.ensureInit();
-    return fs.readFile(resolveSafeLocalPath(userRelPath, this.rootDir));
+    const url = await signedGet(toKey(userRelPath));
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`[oss] getFile failed: ${res.status} ${userRelPath}`);
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab);
   }
 
-  /**
-   * 读取图片文件并转换为 base64 编码的 Data URL。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @returns base64 编码的 Data URL (例如: data:image/png;base64,iVBORw0KGgo...)
-   * @throws 路径不在 OSS 根目录内、文件不存在、不是图片文件等错误
-   */
+  /** 读取图片为 base64 Data URL。 */
   async getImageBase64(userRelPath: string): Promise<string> {
-    await this.ensureInit();
-    const absPath = resolveSafeLocalPath(userRelPath, this.rootDir);
-
-    // 检查文件是否存在且为文件
-    const stat = await fs.stat(absPath);
-    if (!stat.isFile()) {
-      throw new Error(`${userRelPath} 不是文件`);
-    }
-
-    // 获取文件扩展名并确定 MIME 类型
     const ext = path.extname(userRelPath).toLowerCase();
-    const mimeTypes: Record<string, string> = {
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".png": "image/png",
-      ".gif": "image/gif",
-      ".webp": "image/webp",
-      ".bmp": "image/bmp",
-      ".svg": "image/svg+xml",
-      ".ico": "image/x-icon",
-      ".tiff": "image/tiff",
-      ".tif": "image/tiff",
-      ".mp4": "video/mp4",
-      ".mp3": "audio/mpeg",
-    };
-
-    const mimeType = mimeTypes[ext];
+    const mimeType = EXT_MIME[ext];
     if (!mimeType) {
-      throw new Error(`不支持的图片格式: ${ext}。支持的格式: ${Object.keys(mimeTypes).join(", ")}`);
+      throw new Error(`不支持的图片格式: ${ext}。支持的格式: ${Object.keys(EXT_MIME).join(", ")}`);
     }
-
-    // 读取文件并转换为 base64
-    const data = await fs.readFile(absPath);
-    const base64 = data.toString("base64");
-    // 返回完整的 Data URL
-    return `data:${mimeType};base64,${base64}`;
+    const buf = await this.getFile(userRelPath);
+    return `data:${mimeType};base64,${buf.toString("base64")}`;
   }
-  /**
-   * 删除指定路径的文件。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @throws 路径不在 OSS 根目录内、文件不存在等错误
-   */
+
+  /** 删除单个对象。 */
   async deleteFile(userRelPath: string): Promise<void> {
-    await this.ensureInit();
-    await fs.unlink(resolveSafeLocalPath(userRelPath, this.rootDir));
+    const key = toKey(userRelPath);
+    if (!key) return;
+    await callSign({ op: "delete", key });
+    getUrlCache.delete(key);
   }
 
-  /**
-   * 删除指定路径的文件夹及其所有内容。
-   * @param userRelPath 用户传入的相对文件夹路径（使用 / 作为分隔符）
-   * @throws 路径不在 OSS 根目录内、文件夹不存在、目标是文件而非文件夹等错误
-   */
+  /** 删除指定 prefix 下的全部对象（兼容原本地 deleteDirectory 语义）。 */
   async deleteDirectory(userRelPath: string): Promise<void> {
-    await this.ensureInit();
-    const absPath = resolveSafeLocalPath(userRelPath, this.rootDir);
-    const stat = await fs.stat(absPath);
-    if (!stat.isDirectory()) {
-      throw new Error(`${userRelPath} 不是文件夹`);
+    let prefix = toKey(userRelPath);
+    if (!prefix) throw new Error("[oss] deleteDirectory: empty prefix");
+    if (!prefix.endsWith("/")) prefix += "/";
+    await callSign({ op: "deletePrefix", key: prefix });
+    // 清掉相关缓存
+    for (const k of getUrlCache.keys()) {
+      if (k.startsWith(prefix)) getUrlCache.delete(k);
     }
-    await fs.rm(absPath, { recursive: true, force: true });
   }
 
   /**
-   * 将数据写入指定路径的新文件或覆盖已有文件。
-   * 写入前自动创建所需的父文件夹。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @param data 要写入的数据，可以为 Buffer 或字符串
-   * @throws 路径不在 OSS 根目录内等错误
+   * 写入文件。
+   * data 为 string 时按 base64 解码（兼容原 base64 Data URL）。
    */
   async writeFile(userRelPath: string, data: Buffer | string): Promise<void> {
-    await this.ensureInit();
-    const absPath = resolveSafeLocalPath(userRelPath, this.rootDir);
-    await fs.mkdir(path.dirname(absPath), { recursive: true });
-    // 如果 data 是 string，则视为 base64 编码，先解码再写入
-    // 自动去除可能存在的 Data URL 前缀（如 "data:image/png;base64,"）
-    const buffer = typeof data === "string" ? Buffer.from(data.replace(/^data:[^;]+;base64,/, ""), "base64") : data;
-    await fs.writeFile(absPath, buffer);
+    const key = toKey(userRelPath);
+    if (!key) throw new Error("[oss] writeFile: empty key");
+    const buffer =
+      typeof data === "string"
+        ? Buffer.from(data.replace(/^data:[^;]+;base64,/, ""), "base64")
+        : data;
+    const contentType = guessContentType(userRelPath);
+    const signed = await callSign({ op: "put", key, contentType, expires: 3600 });
+    const headers: Record<string, string> = {};
+    if (contentType) headers["Content-Type"] = contentType;
+    const res = await fetch(signed.url, {
+      method: "PUT",
+      headers,
+      // 把 Buffer 转成 ArrayBuffer 视图，符合 fetch 的 BodyInit 类型
+      body: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`[oss] PUT TOS failed: ${res.status} ${text}`);
+    }
+    // 失效缓存（写入后下次 getFileUrl 拿到新签名）
+    getUrlCache.delete(key);
   }
 
-  /**
-   * 检查指定路径文件是否存在。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @returns 文件存在返回 true，否则 false
-   */
+  /** 文件是否存在。通过 HEAD GET-URL 探测。 */
   async fileExists(userRelPath: string): Promise<boolean> {
-    await this.ensureInit();
     try {
-      const stat = await fs.stat(resolveSafeLocalPath(userRelPath, this.rootDir));
-      return stat.isFile();
+      const url = await signedGet(toKey(userRelPath));
+      const res = await fetch(url, { method: "HEAD" });
+      return res.ok;
     } catch {
       return false;
     }
   }
 
   /**
-   * 获取图片的缩略图 URL（最长边不超过 512px，等比缩放）。
-   * 缩略图保存在原路径同目录下的 smallImage 子文件夹中。
-   * 若缩略图已存在则直接返回其 URL；若不存在则同步生成并保存后返回缩略图 URL，
-   * 生成失败时返回原图 URL。
-   * @param userRelPath 用户传入的相对文件路径（使用 / 作为分隔符）
-   * @returns 缩略图 URL（已存在或生成成功）或原图 URL（生成失败时）
+   * 缩略图 URL。
+   *
+   * 原本地实现通过 `?size=20` 让 /oss 路由生成缩略图。TOS 不做服务端缩略图；
+   * 这里直接返回签名 GET URL。前端需要时由 UI 自行处理（保持 API 兼容）。
    */
   async getSmallImageUrl(userRelPath: string): Promise<string> {
-    // 构造缩略图相对路径：在原路径的目录层级前插入 smallImage 目录
-    // 例如：123/abc.jpg => smallImage/123/abc.jpg
-    // const smallImageRelPath = `smallImage/${userRelPath.replace(/^[/\\]+/, "")}`;
-
-    // if (await this.fileExists(smallImageRelPath)) {
-    //   return this.getFileUrl(smallImageRelPath);
-    // }
-
-    // // 缩略图不存在：同步生成，生成失败则返回原图 URL
-    // const originalUrl = await this.getFileUrl(userRelPath);
-
-    // try {
-    //   await this.ensureInit();
-    //   const srcAbsPath = resolveSafeLocalPath(userRelPath, this.rootDir);
-    //   const dstAbsPath = resolveSafeLocalPath(smallImageRelPath, this.rootDir);
-    //   await fs.mkdir(path.dirname(dstAbsPath), { recursive: true });
-    //   await sharp(srcAbsPath)
-    //     .resize(512, 512, { fit: "inside", withoutEnlargement: true })
-    //     .toFile(dstAbsPath);
-    //   console.info(`[${dstAbsPath}]小图写入成功`);
-    return (await this.getFileUrl(userRelPath)) + "?size=20";
-    // } catch (e) {
-    //   // 生成失败返回原图
-    //   console.warn("[OSS] 生成缩略图失败:", e);
-    //   return originalUrl;
-    // }
+    return this.getFileUrl(userRelPath);
   }
 }
 

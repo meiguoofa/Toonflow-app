@@ -14,7 +14,6 @@ import u from "@/utils";
 import jwt from "jsonwebtoken";
 import socketInit from "@/socket/index";
 import { isEletron } from "@/utils/getPath";
-import { ensureThumbnail, ThumbnailSize } from "@/utils/image";
 
 const app = express();
 const server = http.createServer(app);
@@ -59,64 +58,19 @@ export default async function startServe(randomPort: Boolean = false) {
   app.use(express.json({ limit: "100mb" }));
   app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
-  // oss 静态资源
-  const ossDir = u.getPath("oss");
-  if (!fs.existsSync(ossDir)) {
-    fs.mkdirSync(ossDir, { recursive: true });
-  }
-  console.log("文件目录:", ossDir);
-  app.use(
-    "/oss",
-    (req, res, next) => {
-      // 如果传参 type=small，则返回小图
-      if (req.query.size) {
-        const size = req.query.size as string;
-        const smallImageBaseDir = path.join(ossDir, "smallImage");
-        const originalPath = path.join(ossDir, req.path);
-
-        // 解析 size 参数
-        let sizeSubDir: string;
-        let sizeOpts: ThumbnailSize | undefined;
-
-        // 判断是否为 WIDTHxHEIGHT 格式，如 "200x300"：等比压缩到指定宽高边界
-        const dimensMatch = size.match(/^(\d+)x(\d+)$/i);
-        // 判断是否为百分比格式，如 "30"、"30%"：等比压缩到原图的指定百分比
-        const percentMatch = size.match(/^(\d+(?:\.\d+)?)\s*%?$/);
-
-        if (dimensMatch) {
-          const w = parseInt(dimensMatch[1], 10);
-          const h = parseInt(dimensMatch[2], 10);
-          sizeSubDir = `${w}x${h}`;
-          sizeOpts = { type: "dimensions", width: w, height: h };
-        } else if (percentMatch) {
-          const pct = parseFloat(percentMatch[1]);
-          sizeSubDir = `${percentMatch[1]}p`;
-          sizeOpts = { type: "percentage", value: pct };
-        } else {
-          // 无效的 size 参数，降级返回原图
-          express.static(ossDir, { acceptRanges: false })(req, res, next);
-          return;
-        }
-
-        const ext = path.extname(req.path);
-        const base = path.basename(req.path, ext);
-        const dir = path.dirname(req.path);
-        const smallImagePath = path.join(smallImageBaseDir, dir, `${base}_${sizeSubDir}${ext}`);
-
-        ensureThumbnail(originalPath, smallImagePath, sizeOpts).then((thumbnailPath) => {
-          if (thumbnailPath) {
-            res.sendFile(thumbnailPath);
-          } else {
-            // 缩略图生成失败，降级返回原图
-            express.static(ossDir, { acceptRanges: false })(req, res, next);
-          }
-        });
-        return;
-      }
-      next();
-    },
-    express.static(ossDir, { acceptRanges: false }),
-  );
+  // oss 静态资源（已迁 TOS）：保留 /oss/* 前缀做 302 兼容转发，避免存量 DB
+  // 中 `/oss/...` 路径访问失败。详见 Toonflow-Backend/docs/tos-migration.md。
+  app.get("/oss/*", async (req: Request, res: Response) => {
+    try {
+      const key = (req.params as any)[0] as string;
+      if (!key) return res.status(404).end();
+      const url = await u.oss.getFileUrl(key);
+      return res.redirect(302, url);
+    } catch (e: any) {
+      console.warn("[oss compat] redirect failed:", e?.message || e);
+      return res.status(502).send({ message: "oss 临时签名失败" });
+    }
+  });
   // skills 静态资源
   const skillsDir = u.getPath("skills");
   if (!fs.existsSync(skillsDir)) {
@@ -150,9 +104,12 @@ export default async function startServe(randomPort: Boolean = false) {
   }
 
   app.use(async (req, res, next) => {
-    const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
-    if (!setting) return res.status(444).send({ message: "服务器秘钥未配置，请联系管理员" });
-    const { value: tokenKey } = setting;
+    // SaaS 化迁移：本中间件改为「透明验签层」——只验签，不再签发。
+    // secret 与 Toonflow-Backend 共享（详见 Toonflow-Backend/docs/auth-secret.md）。
+    // TODO：本期保留，后期可考虑桌面端不再做 token 校验，全权下放给云端后端。
+    const { getSharedJwtSecret } = await import("@/utils/auth");
+    const tokenKey = await getSharedJwtSecret();
+    if (!tokenKey) return res.status(444).send({ message: "服务器秘钥未配置，请联系管理员" });
     // 从 header 或 query 参数获取 token
     const rawToken = req.headers.authorization || (req.query.token as string) || "";
     const token = rawToken.replace("Bearer ", "");
@@ -161,7 +118,7 @@ export default async function startServe(randomPort: Boolean = false) {
 
     if (!token) return res.status(401).send({ message: "未提供token" });
     try {
-      const decoded = jwt.verify(token, tokenKey as string);
+      const decoded = jwt.verify(token, tokenKey);
       (req as any).user = decoded;
       next();
     } catch (err) {
