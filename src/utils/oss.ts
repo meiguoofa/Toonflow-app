@@ -22,7 +22,7 @@ import { isEletron } from "@/utils/getPath";
 // 详见 Toonflow-Backend/docs/tos-migration.md。
 // =============================================================================
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
+const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 
 // ---- token：复用 db.ts 同源约定 ---------------------------------------------
 let _runtimeToken: string | null = null;

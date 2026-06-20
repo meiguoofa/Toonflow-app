@@ -12,7 +12,7 @@ import type { Knex } from "knex";
 type TableName = keyof DB & string;
 type RowType<TName extends TableName> = DB[TName];
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
+const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 
 // ---- token 来源 -------------------------------------------------------------
 // TODO(Stream D): 接入正式登录后从持久化存储（electron-store/login flow）取 token。
