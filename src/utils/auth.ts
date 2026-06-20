@@ -1,4 +1,5 @@
-import u from "@/utils";
+// 注意：不在顶层 import u（@/utils），否则 utils → db → auth → utils 形成循环依赖。
+// getSharedJwtSecret 内按需动态 import。
 
 /**
  * Toonflow-app 端 token 工具。
@@ -30,12 +31,21 @@ export function clearCurrentToken(): void {
 }
 
 /**
+ * 取当前 token（不抛错版）。给 db.ts / oss.ts 调云端时使用：
+ * 没拿到时返回空串，由调用方决定不带 Authorization header（保持原语义）。
+ * 来源优先级：process.env.TOONFLOW_TOKEN > 登录写入的 cachedToken。
+ */
+export function peekToken(): string {
+  return process.env.TOONFLOW_TOKEN || cachedToken || "";
+}
+
+/**
  * 取当前 token，给 Stream B 的 utils/db.ts 调云端 /api/db/query 时使用。
  * 没拿到时抛错——主动暴露问题，比悄悄发匿名请求好。
  */
 export function getCurrentToken(): string {
-  if (process.env.TOONFLOW_TOKEN) return process.env.TOONFLOW_TOKEN;
-  if (cachedToken) return cachedToken;
+  const token = peekToken();
+  if (token) return token;
   throw new Error("[auth] no token available; please login first or set TOONFLOW_TOKEN");
 }
 
@@ -51,6 +61,7 @@ export function getCurrentToken(): string {
  */
 export async function getSharedJwtSecret(): Promise<string | null> {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  const u = (await import("@/utils")).default;
   const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
   if (setting?.value) return setting.value as string;
   return null;

@@ -1,5 +1,6 @@
 import type { DB } from "@/types/database";
 import type { Knex } from "knex";
+import { peekToken } from "@/utils/auth";
 
 // =============================================================================
 // HTTP 代理：把 Knex 链式调用序列化成 JSON，POST 给后端回放。
@@ -15,15 +16,7 @@ type RowType<TName extends TableName> = DB[TName];
 const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 
 // ---- token 来源 -------------------------------------------------------------
-// TODO(Stream D): 接入正式登录后从持久化存储（electron-store/login flow）取 token。
-// 暂时支持：环境变量 TOONFLOW_TOKEN、或运行时 setToken() 注入到模块变量。
-let _runtimeToken: string | null = null;
-export function setToken(token: string | null) {
-  _runtimeToken = token;
-}
-function getStoredToken(): string {
-  return _runtimeToken || process.env.TOONFLOW_TOKEN || "";
-}
+// 统一从 utils/auth 取（登录路由 setCurrentToken 写入 / 环境变量 TOONFLOW_TOKEN）。
 
 // ---- 终结方法 ---------------------------------------------------------------
 // 与协议文档保持一致；select 不在此集合里——它会被特殊处理：作为 calls 末尾的中间方法，
@@ -55,7 +48,7 @@ async function executeQuery(
     throw new Error("[db proxy] query has no terminal method");
   }
 
-  const token = getStoredToken();
+  const token = peekToken();
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 

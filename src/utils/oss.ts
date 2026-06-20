@@ -1,5 +1,6 @@
 import path from "node:path";
 import { isEletron } from "@/utils/getPath";
+import { peekToken } from "@/utils/auth";
 
 // =============================================================================
 // TOS 适配版 OSS 客户端。
@@ -24,18 +25,10 @@ import { isEletron } from "@/utils/getPath";
 
 const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 
-// ---- token：复用 db.ts 同源约定 ---------------------------------------------
-let _runtimeToken: string | null = null;
-export function setToken(token: string | null) {
-  _runtimeToken = token;
-}
-function getStoredToken(): string {
-  return _runtimeToken || process.env.TOONFLOW_TOKEN || "";
-}
-
+// ---- token：统一从 utils/auth 取（与 db.ts 同源） ----------------------------
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json", ...(extra || {}) };
-  const token = getStoredToken();
+  const token = peekToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   return headers;
 }

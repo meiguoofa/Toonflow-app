@@ -1,3 +1,8 @@
+import dotenv from "dotenv";
+
+// 加载项目根目录的 .env（JWT_SECRET / TOONFLOW_BACKEND_URL 等）到 process.env
+dotenv.config();
+
 // 判断是否为打包后的 Electron 环境
 const isElectron = typeof process.versions?.electron !== "undefined";
 let isPackaged = false;

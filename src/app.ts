@@ -60,9 +60,10 @@ export default async function startServe(randomPort: Boolean = false) {
 
   // oss 静态资源（已迁 TOS）：保留 /oss/* 前缀做 302 兼容转发，避免存量 DB
   // 中 `/oss/...` 路径访问失败。详见 Toonflow-Backend/docs/tos-migration.md。
-  app.get("/oss/*", async (req: Request, res: Response) => {
+  app.get("/oss/*splat", async (req: Request, res: Response) => {
     try {
-      const key = (req.params as any)[0] as string;
+      const splat = (req.params as any).splat;
+      const key = (Array.isArray(splat) ? splat.join("/") : splat) as string;
       if (!key) return res.status(404).end();
       const url = await u.oss.getFileUrl(key);
       return res.redirect(302, url);
