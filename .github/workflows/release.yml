@@ -45,6 +45,8 @@ jobs:
         run: yarn dist:win --${{ matrix.arch }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOONFLOW_BACKEND_URL: ${{ vars.TOONFLOW_BACKEND_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -92,6 +94,8 @@ jobs:
         run: yarn dist:mac --${{ matrix.arch }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOONFLOW_BACKEND_URL: ${{ vars.TOONFLOW_BACKEND_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -137,6 +141,8 @@ jobs:
         run: yarn dist:linux --${{ matrix.arch }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOONFLOW_BACKEND_URL: ${{ vars.TOONFLOW_BACKEND_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

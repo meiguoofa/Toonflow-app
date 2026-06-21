@@ -9,6 +9,18 @@ if (!process.env.NODE_ENV) {
 
 const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
 
+// 构建期注入的客户端配置（来自环境变量 / CI Secrets）。
+// 仅在对应变量非空时注入，避免覆盖 dev 下的运行时读取。
+const injectedDefine: Record<string, string> = {
+  __APP_VERSION__: JSON.stringify(pkg.version),
+};
+if (process.env.TOONFLOW_BACKEND_URL) {
+  injectedDefine["process.env.TOONFLOW_BACKEND_URL"] = JSON.stringify(process.env.TOONFLOW_BACKEND_URL);
+}
+if (process.env.JWT_SECRET) {
+  injectedDefine["process.env.JWT_SECRET"] = JSON.stringify(process.env.JWT_SECRET);
+}
+
 const external = [
   "electron",
   "@huggingface/transformers",
@@ -42,9 +54,7 @@ const appBuildConfig: esbuild.BuildOptions = {
   },
   sourcemap: false,
   external,
-  define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
-  },
+  define: injectedDefine,
 };
 
 // Electron 主进程打包配置
@@ -63,9 +73,7 @@ const mainBuildConfig: esbuild.BuildOptions = {
   },
   sourcemap: false,
   external,
-  define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
-  },
+  define: injectedDefine,
 };
 
 (async () => {
