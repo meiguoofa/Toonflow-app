@@ -26,17 +26,9 @@ export default router.post(
     const parentAssets = await query.offset(offset).limit(limit);
 
     // 统计总数
-    const totalQuery = (await u
-      .db("o_assets")
-      .where("projectId", projectId)
-      .andWhere("type", type)
-      .andWhere((qb) => {
-        if (name) {
-          qb.andWhere("name", "like", `%${name}%`);
-        }
-      })
-      .count("* as total")
-      .first()) as any;
+    let countQuery = u.db("o_assets").where("projectId", projectId).andWhere("type", type);
+    if (name) countQuery = countQuery.andWhere("name", "like", `%${name}%`);
+    const totalQuery = (await countQuery.count("* as total").first()) as any;
     res.status(200).send(success({ data: parentAssets, total: totalQuery?.total }));
   },
 );

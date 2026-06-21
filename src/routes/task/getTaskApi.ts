@@ -16,39 +16,22 @@ export default router.post(
   async (req, res) => {
     const { taskClass, state, projectId, page = 1, limit = 10 }: any = req.body;
     const offset = (page - 1) * limit;
-    const data = await u
+    let dataQuery = u
       .db("o_tasks")
-      .leftJoin("o_project", "o_project.id", "o_tasks.projectId")
-      .andWhere((qb) => {
-        if (taskClass) {
-          qb.andWhere("o_tasks.taskClass", taskClass);
-        }
-        if (state) {
-          qb.andWhere("o_tasks.state", state);
-        }
-        if (projectId) {
-          qb.andWhere("o_tasks.projectId", projectId);
-        }
-      })
-      .select("o_tasks.*", "o_project.* ")
+      .leftJoin("o_project", "o_project.id", "o_tasks.projectId");
+    if (taskClass) dataQuery = dataQuery.andWhere("o_tasks.taskClass", taskClass);
+    if (state) dataQuery = dataQuery.andWhere("o_tasks.state", state);
+    if (projectId) dataQuery = dataQuery.andWhere("o_tasks.projectId", projectId);
+    const data = await dataQuery
+      .select("o_tasks.*", "o_project.*")
       .offset(offset)
       .limit(limit)
       .orderBy("o_tasks.id", "desc");
-    const totalQuery = (await u
-      .db("o_tasks")
-      .andWhere((qb) => {
-        if (taskClass) {
-          qb.andWhere("o_tasks.taskClass", taskClass);
-        }
-        if (projectId) {
-          qb.andWhere("o_tasks.projectId", projectId);
-        }
-        if (state) {
-          qb.andWhere("o_tasks.state", state);
-        }
-      })
-      .count("* as total")
-      .first()) as any;
+    let countQuery = u.db("o_tasks");
+    if (taskClass) countQuery = countQuery.andWhere("o_tasks.taskClass", taskClass);
+    if (projectId) countQuery = countQuery.andWhere("o_tasks.projectId", projectId);
+    if (state) countQuery = countQuery.andWhere("o_tasks.state", state);
+    const totalQuery = (await countQuery.count("* as total").first()) as any;
     res.status(200).send(success({ data, total: totalQuery?.total }));
   },
 );

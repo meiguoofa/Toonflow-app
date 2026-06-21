@@ -48,11 +48,11 @@ export default router.post(
 
     const projectSettingData = await u.db("o_project").where("id", projectId).select("imageModel", "imageQuality", "artStyle", "videoRatio").first();
 
-    // 按 rowid 顺序查出每个 storyboard 关联的 assetId 有序列表
+    // 按 seq（插入顺序）查出每个 storyboard 关联的 assetId 有序列表
     const assets2StoryboardRows = await u
       .db("o_assets2Storyboard")
       .whereIn("storyboardId", storyIds)
-      .orderBy("rowid")
+      .orderBy("seq")
       .select("storyboardId", "assetId");
 
     // 收集所有 assetId，批量查对应的 imageId
@@ -65,7 +65,7 @@ export default router.post(
       });
     }
 
-    // 按 rowid 顺序重建 assetRecord，值为有序的 imageId 列表
+    // 按 seq（插入顺序）重建 assetRecord，值为有序的 imageId 列表
     const assetRecord: Record<number, number[]> = {};
     assets2StoryboardRows.forEach((item: any) => {
       if (!assetRecord[item.storyboardId]) {

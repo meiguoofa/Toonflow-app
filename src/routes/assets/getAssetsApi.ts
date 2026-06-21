@@ -62,18 +62,13 @@ export default router.post(
     );
 
     // 统计总数
-    const totalQuery = (await u
+    let countQuery = u
       .db("o_assets")
       .where("projectId", projectId)
       .andWhere("type", type)
-      .andWhere("assetsId", null)
-      .andWhere((qb) => {
-        if (name) {
-          qb.andWhere("name", "like", `%${name}%`);
-        }
-      })
-      .count("* as total")
-      .first()) as any;
+      .andWhere("assetsId", null);
+    if (name) countQuery = countQuery.andWhere("name", "like", `%${name}%`);
+    const totalQuery = (await countQuery.count("* as total").first()) as any;
     res.status(200).send(success({ data: result, total: totalQuery?.total }));
   },
 );

@@ -42,6 +42,11 @@ export default router.post("/", async (req, res) => {
   try {
     const artPromptsDir = u.getPath(["skills", "story_skills"]);
 
+    // 目录不存在时返回空列表，避免 readdirSync 抛错导致 500
+    if (!fs.existsSync(artPromptsDir)) {
+      return res.status(200).send(success([]));
+    }
+
     // 读取所有风格文件夹
     const styleDirs = fs
       .readdirSync(artPromptsDir, { withFileTypes: true })
@@ -53,8 +58,8 @@ export default router.post("/", async (req, res) => {
         const styleDir = path.join(artPromptsDir, directorManual);
         const images = await readAllImages(directorManual);
         const readmePath = path.join(styleDir, "README.md");
-        const readmeContent = fs.readFileSync(readmePath, "utf-8");
-        const firstLine = readmeContent.split("\n")[0].replace(/--/g, "");
+        const readmeContent = readMd(readmePath);
+        const firstLine = (readmeContent.split("\n")[0] || directorManual).replace(/--/g, "");
         const data = DATA_MAP.map(({ label, value, subDir }) => {
           let mdPath: string;
           if (subDir) {

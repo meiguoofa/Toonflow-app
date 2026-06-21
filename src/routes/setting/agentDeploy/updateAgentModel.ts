@@ -12,10 +12,10 @@ export default router.post(
     name: z.string(),
     model: z.string(),
     modelName: z.string(),
-    vendorId: z.string().nullable(),
+    vendorId: z.string().nullish(),
     desc: z.string(),
-    temperature: z.number().optional(),
-    maxOutputTokens: z.number().optional(),
+    temperature: z.number().nullish(),
+    maxOutputTokens: z.number().nullish(),
   }),
   async (req, res) => {
     const { id, name, model, modelName, vendorId, desc, temperature, maxOutputTokens } = req.body;

@@ -167,22 +167,22 @@ export default router.post(
         }
         if (!validScripts.length) return;
         const validScriptIds = validScripts.map((v) => v.id);
-        // 修改状态为正在提取中
-        await u.db("o_script").where("projectId", projectId).whereIn("id", validScriptIds).update({
-          extractState: 0, // 正在提取
-        });
-        // 查询当前项目已有的资产列表，提供给 AI 参考
-        const existingAssets = await u.db("o_assets").where("projectId", projectId).select("name", "type");
-        const existingAssetsList = existingAssets.map((a) => `${a.name}(${a.type})`).join("、");
-
-        // 拼接多集剧本内容，每集用分隔标记
-        const scriptsContent = validScripts
-          .map(({ id, script }) => `===== 【剧本ID: ${id}】${script.name || ""} =====\n${script.content}`)
-          .join("\n\n");
-
         let collectedNew: NewAsset[] = [];
         let collectedExisting: ExistingAssetRef[] = [];
         try {
+          // 修改状态为正在提取中
+          await u.db("o_script").where("projectId", projectId).whereIn("id", validScriptIds).update({
+            extractState: 0, // 正在提取
+          });
+          // 查询当前项目已有的资产列表，提供给 AI 参考
+          const existingAssets = await u.db("o_assets").where("projectId", projectId).select("name", "type");
+          const existingAssetsList = existingAssets.map((a) => `${a.name}(${a.type})`).join("、");
+
+          // 拼接多集剧本内容，每集用分隔标记
+          const scriptsContent = validScripts
+            .map(({ id, script }) => `===== 【剧本ID: ${id}】${script.name || ""} =====\n${script.content}`)
+            .join("\n\n");
+
           const resultTool = tool({
             description: "返回结果时必须调用这个工具",
             inputSchema: jsonSchema<{ newAssets: NewAsset[]; existingAssetRefs: ExistingAssetRef[] }>(

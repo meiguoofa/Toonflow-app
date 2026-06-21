@@ -1,6 +1,5 @@
 import db from "@/utils/db";
 import oss from "@/utils/oss";
-import getConfig from "./utils/getConfig";
 import { v4 as uuid } from "uuid";
 import error from "@/utils/error";
 import cleanNovel from "./utils/cleanNovel";
@@ -17,7 +16,6 @@ import * as vendor from "@/utils/vendor";
 export default {
   db,
   oss,
-  getConfig,
   uuid,
   error,
   cleanNovel,

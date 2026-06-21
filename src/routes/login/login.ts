@@ -3,6 +3,7 @@ import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { z } from "zod";
 import { setCurrentToken } from "@/utils/auth";
+import { recoverStuckStates } from "@/utils/recoverStuckStates";
 
 const router = express.Router();
 
@@ -47,6 +48,9 @@ export default router.post(
 
       // 缓存到本地模块，供桌面端其它请求向云端后端透传
       setCurrentToken(token);
+
+      // 登录后自愈：重置上次中断遗留的「进行中」状态（不阻塞登录响应）
+      recoverStuckStates().catch((e) => console.warn("[recoverStuckStates] 失败:", e?.message || e));
 
       // 保持与原响应结构兼容（token 前缀 "Bearer "，name / id 平铺）
       return res.status(200).send(

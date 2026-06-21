@@ -5,8 +5,14 @@ export default (fileName?: string[] | string) => {
   let basePath: string;
   if (typeof process.versions?.electron !== "undefined") {
     const { app } = require("electron");
-    const userDataDir: string = app.getPath("userData");
-    basePath = path.join(userDataDir, "data");
+    // 打包发布版用 userData/data（启动时 initializeData 会把资源 data 拷过去）；
+    // 开发环境（未打包）直接用仓库 cwd/data（自带 skills/vendor 等完整数据），
+    // 与 dev 的 web 路径策略（scripts/main.ts 用 cwd/data）保持一致。
+    if (app.isPackaged) {
+      basePath = path.join(app.getPath("userData"), "data");
+    } else {
+      basePath = path.join(process.cwd(), "data");
+    }
   } else {
     basePath = path.join(process.cwd(), "data");
   }
