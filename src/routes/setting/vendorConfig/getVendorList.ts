@@ -10,10 +10,7 @@ export default router.post("/", async (req, res) => {
     await Promise.all(
       data.map(async (item) => {
         const vendor = u.vendor.getVendor(item.id!);
-        if (!vendor) {
-          await u.db("o_vendorConfig").where("id", item.id).delete();
-          return null
-        };
+        if (!vendor) return null; // 仅跳过展示，不删除 DB 记录（o_vendorConfig 为云端共享表）
         return {
           ...item,
           inputValues: JSON.parse(item.inputValues ?? "{}"),

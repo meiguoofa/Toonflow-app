@@ -108,7 +108,7 @@ export default async function startServe(randomPort: Boolean = false) {
     // SaaS 化迁移：本中间件改为「透明验签层」——只验签，不再签发。
     // secret 与 Toonflow-Backend 共享（详见 Toonflow-Backend/docs/auth-secret.md）。
     // TODO：本期保留，后期可考虑桌面端不再做 token 校验，全权下放给云端后端。
-    const { getSharedJwtSecret } = await import("@/utils/auth");
+    const { getSharedJwtSecret, setCurrentToken } = await import("@/utils/auth");
     const tokenKey = await getSharedJwtSecret();
     if (!tokenKey) return res.status(444).send({ message: "服务器秘钥未配置，请联系管理员" });
     // 从 header 或 query 参数获取 token
@@ -121,6 +121,9 @@ export default async function startServe(randomPort: Boolean = false) {
     try {
       const decoded = jwt.verify(token, tokenKey);
       (req as any).user = decoded;
+      // 把当前请求的 token 同步给桌面端 Node 侧（db proxy / oss 转发云端时取用）。
+      // 前端持有 token 重启后不再走登录流程，cachedToken 会丢失，故每次验签通过都刷新。
+      setCurrentToken(token);
       next();
     } catch (err) {
       return res.status(401).send({ message: "无效的token" });

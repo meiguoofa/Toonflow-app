@@ -2,6 +2,7 @@ import { transform } from "sucrase";
 import fs from "fs";
 import path from "path";
 import u from "@/utils";
+import vendorJson from "@/lib/vendor.json";
 
 export function writeCode(id: string | number, tsCode: string) {
   const rootDir = u.getPath("vendor")
@@ -15,8 +16,9 @@ export function writeCode(id: string | number, tsCode: string) {
 export function getCode(id: string): string {
   const rootDir = u.getPath("vendor");
   const targetFile = path.join(rootDir, `${id}.ts`);
-  if (!fs.existsSync(targetFile)) return "";
-  return fs.readFileSync(targetFile, "utf-8");
+  // 本地文件优先（自定义供应商 / 用户改过的代码）；缺失时回退到打包内置的 vendor.json
+  if (fs.existsSync(targetFile)) return fs.readFileSync(targetFile, "utf-8");
+  return (vendorJson as Record<string, string>)[`${id}.ts`] ?? "";
 }
 
 export async function getModelList(id: string): Promise<Array<any>> {

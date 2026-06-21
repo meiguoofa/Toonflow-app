@@ -19,12 +19,18 @@ const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 // 统一从 utils/auth 取（登录路由 setCurrentToken 写入 / 环境变量 TOONFLOW_TOKEN）。
 
 // ---- 终结方法 ---------------------------------------------------------------
-// 与协议文档保持一致；select 不在此集合里——它会被特殊处理：作为 calls 末尾的中间方法，
-// 在 await 触发 .then 时把它"提升"为 terminal。
+// 与协议文档保持一致；select 不在此集合里——它会被特殊处理：作为 calls 中的中间方法，
+// 在 await 触发 .then 时把它"提升"为 terminal（见 executeQuery）。
+// first 与聚合方法（count/min/...）也单独处理：见 createQueryBuilder。
 const TERMINAL_METHODS = new Set<string>([
-  "first", "find", "count", "countDistinct", "min", "max", "sum", "avg",
-  "insert", "update", "del", "delete", "truncate",
+  "find", "insert", "update", "del", "delete", "truncate",
   "pluck",
+]);
+
+// 聚合方法：在 Knex 中可继续 .first() 取首行，也可直接 await 取数组。
+// 故惰性记录为"待定 terminal"，由后续 .first() / await 决定如何取值。
+const AGGREGATE_METHODS = new Set<string>([
+  "count", "countDistinct", "min", "max", "sum", "avg",
 ]);
 
 interface Call {
@@ -38,14 +44,19 @@ async function executeQuery(
   calls: Call[],
   terminal?: { method: string; args: any[] },
 ): Promise<any> {
-  // await db("xx").select(...) 时 .then 触发执行：把末尾的 select 提为 terminal
-  if (!terminal && calls.length > 0 && calls[calls.length - 1].method === "select") {
-    const last = calls[calls.length - 1];
-    terminal = { method: "select", args: last.args };
-    calls = calls.slice(0, -1);
-  }
+  // await db("xx")...（无显式终结方法）时 .then 触发执行：等价于一次 select 查询。
+  // select 在 Knex 链中可出现在任意位置（其后可再跟 where/offset/limit/orderBy 等），
+  // 故把链中所有 select 的列参数抽出合并为 terminal，其余调用保留为中间方法；
+  // 链中完全没有 select 时按 `select *`（空参）处理。后端协议允许 select 作为终结方法。
   if (!terminal) {
-    throw new Error("[db proxy] query has no terminal method");
+    const selectArgs: any[] = [];
+    const rest: Call[] = [];
+    for (const c of calls) {
+      if (c.method === "select") selectArgs.push(...c.args);
+      else rest.push(c);
+    }
+    terminal = { method: "select", args: selectArgs };
+    calls = rest;
   }
 
   const token = peekToken();
@@ -75,7 +86,12 @@ async function executeQuery(
 
 // ---- 链式 Proxy 构造 --------------------------------------------------------
 // 使用 function 作为 target，使得 Proxy 对 then 的拦截能让 await 工作。
-function createQueryBuilder(table: string, calls: Call[]): any {
+// pendingTerminal：聚合方法（count 等）惰性记录的待定 terminal，等 .first() / await 决定取值方式。
+function createQueryBuilder(
+  table: string,
+  calls: Call[],
+  pendingTerminal?: { method: string; args: any[] },
+): any {
   const target: any = function () {};
   return new Proxy(target, {
     get(_t, prop: string | symbol) {
@@ -83,19 +99,35 @@ function createQueryBuilder(table: string, calls: Call[]): any {
         // Symbol.toPrimitive / Symbol.iterator 等：返回 undefined 让默认行为生效
         return undefined;
       }
-      // await 时 JS 会读 .then —— 触发请求执行
+      // await 时 JS 会读 .then —— 触发请求执行（pendingTerminal 存在则按聚合直接返回数组）
       if (prop === "then") {
         return (resolve: (v: any) => void, reject: (e: any) => void) => {
-          executeQuery(table, calls).then(resolve, reject);
+          executeQuery(table, calls, pendingTerminal).then(resolve, reject);
         };
       }
-      // 终结方法：返回函数，调用时立即触发请求
+      // 聚合方法：惰性记录为待定 terminal，可继续 .first() 取首行，或直接 await 取数组
+      if (AGGREGATE_METHODS.has(prop)) {
+        return (...args: any[]) =>
+          createQueryBuilder(table, calls, { method: prop, args });
+      }
+      // .first()：若前面是聚合（如 count().first()），执行聚合并取首行；否则作为普通 first 终结
+      if (prop === "first") {
+        return (...args: any[]) => {
+          if (pendingTerminal) {
+            return executeQuery(table, calls, pendingTerminal).then(
+              (r: any) => (Array.isArray(r) ? r[0] ?? null : r),
+            );
+          }
+          return executeQuery(table, calls, { method: "first", args });
+        };
+      }
+      // 其它终结方法：返回函数，调用时立即触发请求
       if (TERMINAL_METHODS.has(prop)) {
         return (...args: any[]) => executeQuery(table, calls, { method: prop, args });
       }
       // 其它：视为中间方法，记录进 calls，返回新 proxy
       return (...args: any[]) =>
-        createQueryBuilder(table, [...calls, { method: prop, args }]);
+        createQueryBuilder(table, [...calls, { method: prop, args }], pendingTerminal);
     },
     apply() {
       throw new Error("[db proxy] query builder is not directly callable");
