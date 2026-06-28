@@ -1,8 +1,46 @@
 import { generateText, streamText, wrapLanguageModel, stepCountIs, extractReasoningMiddleware } from "ai";
 import { devToolsMiddleware } from "@ai-sdk/devtools";
-import axios from "axios";
 import { transform } from "sucrase";
 import u from "@/utils";
+import { peekToken } from "@/utils/auth";
+
+const TOONFLOW_BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
+
+// =============================================================================
+// HTTP 代理：Image/Video/Audio 通过后端 /api/ai/* 调用,后端负责 vendor 加载、
+// 凭据、限流队列、退避重试。Text 仍走本地 vendor + AI SDK streamText(phase 1 不迁)。
+// 协议契约：Toonflow-Backend/docs/ai-proxy-protocol.md
+// =============================================================================
+async function proxyAiCall(
+  kind: "image" | "video" | "audio",
+  vendorId: string,
+  model: string,
+  config: unknown,
+): Promise<string> {
+  const url = `${TOONFLOW_BACKEND_URL}/api/ai/${kind}`;
+  const token = peekToken();
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ vendorId, model, config }),
+  });
+  let json: any;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error(`[ai proxy] invalid JSON response (status ${res.status})`);
+  }
+  if (!json || typeof json !== "object") {
+    throw new Error(`[ai proxy] malformed response`);
+  }
+  if (json.code !== 0) {
+    throw new Error(`[ai proxy ${json.code}] ${json.message ?? "request failed"}`);
+  }
+  return json.data.result as string;
+}
 
 type AiType =
   | "scriptAgent"
@@ -161,19 +199,6 @@ async function withTaskRecord<T>(
   }
 }
 
-async function urlToBase64(url: string, retries = 3, delay = 1000): Promise<string> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const res = await axios.get(url, { responseType: "arraybuffer" });
-      const base64 = Buffer.from(res.data).toString("base64");
-      return `${base64}`;
-    } catch (e) {
-      if (attempt === retries) throw e;
-      await new Promise((resolve) => setTimeout(resolve, delay * attempt));
-    }
-  }
-  throw new Error("urlToBase64 failed");
-}
 class AiText {
   private AiType: AiType | `${string}:${string}`;
   private think?: boolean;
@@ -218,15 +243,6 @@ class AiText {
   }
 }
 
-function referenceList2imageBase642(id: string, input: any) {
-  const version = u.vendor.getVendor(id).version;
-  if (!version || isNaN(parseFloat(version)) || parseFloat(version) < 2.0) {
-    input.imageBase64 = input.referenceList.map((item: any) => item.base64);
-    return input;
-  }
-  return input;
-}
-
 export type ReferenceList = { type: "image"; base64: string } | { type: "audio"; base64: string } | { type: "video"; base64: string };
 
 interface ImageConfig {
@@ -250,18 +266,16 @@ class AiImage {
     this.key = key;
   }
   async run(input: ImageConfig, taskRecord?: TaskRecord) {
-    const modelName = await resolveModelName(this.key);
     const exec = async (mn: `${string}:${string}`) => {
-      const fn = await getVendorTemplateFn("imageRequest", mn);
-      await referenceList2imageBase642(mn.split(/:(.+)/)[0], input);
-      this.result = await fn(input);
-      if (this.result.startsWith("http")) this.result = await urlToBase64(this.result);
+      const [vendorId, model] = mn.split(/:(.+)/);
+      this.result = await proxyAiCall("image", vendorId, model, input);
       return this;
     };
     if (taskRecord) {
       await withTaskRecord(this.key, taskRecord.taskClass, taskRecord.describe, taskRecord.relatedObjects, taskRecord.projectId, exec);
       return this;
     }
+    const modelName = await resolveModelName(this.key);
     await exec(modelName);
     return this;
   }
@@ -296,25 +310,17 @@ class AiVideo {
     this.key = key;
   }
   async run(input: VideoConfig, taskRecord?: TaskRecord) {
-    const modelName = await resolveModelName(this.key);
-    try {
-      const exec = async (mn: `${string}:${string}`) => {
-        const fn = await getVendorTemplateFn("videoRequest", mn);
-        await referenceList2imageBase642(mn.split(/:(.+)/)[0], input);
-
-        this.result = await fn(input);
-
-        if (this.result.startsWith("http")) this.result = await urlToBase64(this.result);
-      };
-      if (taskRecord) {
-        await withTaskRecord(this.key, taskRecord.taskClass, taskRecord.describe, taskRecord.relatedObjects, taskRecord.projectId, exec);
-        return this;
-      }
-      await exec(modelName);
+    const exec = async (mn: `${string}:${string}`) => {
+      const [vendorId, model] = mn.split(/:(.+)/);
+      this.result = await proxyAiCall("video", vendorId, model, input);
+    };
+    if (taskRecord) {
+      await withTaskRecord(this.key, taskRecord.taskClass, taskRecord.describe, taskRecord.relatedObjects, taskRecord.projectId, exec);
       return this;
-    } catch (e) {
-      throw e;
     }
+    const modelName = await resolveModelName(this.key);
+    await exec(modelName);
+    return this;
   }
   async save(path: string) {
     await u.oss.writeFile(path, this.result);
@@ -328,20 +334,15 @@ class AiAudio {
     this.key = key;
   }
   async run(input: VideoConfig, taskRecord?: TaskRecord) {
-    const modelName = await resolveModelName(this.key);
     const exec = async (mn: `${string}:${string}`) => {
-      try {
-        const fn = await getVendorTemplateFn("ttsRequest", mn);
-        await referenceList2imageBase642(mn.split(/:(.+)/)[0], input);
-        this.result = await fn(input);
-
-        if (this.result.startsWith("http")) this.result = await urlToBase64(this.result);
-        return this;
-      } catch (e) {}
+      const [vendorId, model] = mn.split(/:(.+)/);
+      this.result = await proxyAiCall("audio", vendorId, model, input);
+      return this;
     };
     if (taskRecord) {
       return withTaskRecord(this.key, taskRecord.taskClass, taskRecord.describe, taskRecord.relatedObjects, taskRecord.projectId, exec);
     }
+    const modelName = await resolveModelName(this.key);
     return await exec(modelName);
   }
   async save(path: string) {
