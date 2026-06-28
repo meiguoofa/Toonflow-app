@@ -1,7 +1,6 @@
 import express from "express";
-import { success, error } from "@/lib/responseFormat";
+import { success } from "@/lib/responseFormat";
 import u from "@/utils";
-import initDB from "@/lib/initDB";
 
 const router = express.Router();
 

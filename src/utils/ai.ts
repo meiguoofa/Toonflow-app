@@ -1,6 +1,7 @@
 import { generateText, streamText, wrapLanguageModel, stepCountIs, extractReasoningMiddleware } from "ai";
 import { devToolsMiddleware } from "@ai-sdk/devtools";
-import { transform } from "sucrase";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import u from "@/utils";
 import { peekToken } from "@/utils/auth";
 
@@ -148,33 +149,35 @@ async function getModelConfig(value: AiType | `${string}:${string}`) {
   return null;
 }
 
-async function getVendorTemplateFn(
-  fnName: "textRequest",
-  modelName: `${string}:${string}`,
-): Promise<(think?: boolean, thinkLevel?: 0 | 1 | 2 | 3) => any>;
-async function getVendorTemplateFn(fnName: Exclude<FnName, "textRequest">, modelName: `${string}:${string}`): Promise<(input: any) => any>;
-async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${string}`): Promise<any> {
-  const [id, name] = modelName.split(/:(.+)/);
-  const vendorConfigData = await u.db("o_vendorConfig").where("id", id).first();
-  if (!vendorConfigData) throw new Error(`未找到供应商配置 id=${id}`);
-  const modelList = await u.vendor.getModelList(id);
-  const selectedModel = modelList.find((i: any) => i.modelName == name);
-  if (!selectedModel) throw new Error(`未找到模型 ${name} id=${id}`);
-  const code = u.vendor.getCode(id);
-  const jsCode = transform(code, { transforms: ["typescript"] }).code;
-  const running = u.vm(jsCode);
-  if (running.vendor) {
-    Object.assign(running.vendor.inputValues, JSON.parse(vendorConfigData.inputValues ?? "{}"));
-    running.vendor.models = modelList;
+/**
+ * Phase 2: 按 vendor.protocol 选 SDK 工厂创建文本模型。取代旧的"跑 vendor 代码拿 textRequest 函数"。
+ *
+ * 当前支持的 protocol：
+ *   - openai-compatible: 覆盖 OpenAI / DeepSeek / 火山 ark / Moonshot / Qwen / 智谱 等绝大多数
+ *   - google: 给 grsai 用
+ *
+ * 注意：DeepSeek 的 thinking 模式（reasoning_effort + extraBody）phase 2 暂未透传——
+ * createOpenAICompatible 不原生支持 think。功能降级为"正常文本回复"。后续如需 think，
+ * 可在这里按 modelMeta.think 注入 extraBody。
+ */
+function createTextModel(
+  protocol: string | null,
+  modelName: string,
+  inputValues: Record<string, string>,
+): any {
+  const apiKey = (inputValues.apiKey ?? "").replace(/^Bearer\s+/i, "");
+  if (!apiKey) throw new Error("缺少 API Key，请在 Settings → Model Providers 配置并启用对应供应商");
+  if (protocol === "openai-compatible") {
+    return createOpenAICompatible({
+      name: "openai-compatible",
+      baseURL: inputValues.baseUrl ?? "",
+      apiKey,
+    })(modelName);
   }
-  const fn = running[fnName];
-  if (!fn) throw new Error(`未找到供应商配置中的函数 ${fnName} id=${id}`);
-  if (fnName == "textRequest")
-    return (think?: boolean, thinkLevel: 0 | 1 | 2 | 3 = 0) => {
-      const effectiveThink = think ?? !!selectedModel.think;
-      return fn(selectedModel, effectiveThink, thinkLevel);
-    };
-  else return <T>(input: T) => fn(input, selectedModel);
+  if (protocol === "google") {
+    return createGoogleGenerativeAI({ apiKey })(modelName);
+  }
+  throw new Error(`不支持的 protocol: ${protocol ?? "(空)"}；该供应商可能仅支持图像/视频，无文本能力`);
 }
 
 async function withTaskRecord<T>(
@@ -211,8 +214,13 @@ class AiText {
   private async resolveModel(middleware?: any | any[]) {
     const switchAiDevTool = await u.db("o_setting").where("key", "switchAiDevTool").first();
     const modelName = await resolveModelName(this.AiType);
-    const sdkFn = await getVendorTemplateFn("textRequest", modelName);
-    const baseModel = await sdkFn(this.think, this.thinkLevel);
+    const [vendorId, modelStr] = modelName.split(/:(.+)/);
+
+    // phase 2: 不再跑 vendor 代码，直接从后端拿 vendor 元数据（含 protocol + inputValues）
+    const vendor = await u.vendor.getVendor(vendorId);
+    if (!vendor) throw new Error(`未找到供应商配置 id=${vendorId}`);
+    const baseModel = createTextModel(vendor.protocol, modelStr, vendor.inputValues ?? {});
+
     const mws = [
       ...(switchAiDevTool?.value === "1" ? [devToolsMiddleware()] : []),
       ...(middleware ? (Array.isArray(middleware) ? middleware : [middleware]) : []),
@@ -267,8 +275,9 @@ class AiImage {
   }
   async run(input: ImageConfig, taskRecord?: TaskRecord) {
     const exec = async (mn: `${string}:${string}`) => {
-      const [vendorId, model] = mn.split(/:(.+)/);
-      this.result = await proxyAiCall("image", vendorId, model, input);
+      const [vendorId, modelName] = mn.split(/:(.+)/);
+      // 只传 modelName 字符串，后端按 modelName 查完整 model 对象（含 mode/audio 等业务字段）
+      this.result = await proxyAiCall("image", vendorId, modelName, input);
       return this;
     };
     if (taskRecord) {
@@ -311,8 +320,8 @@ class AiVideo {
   }
   async run(input: VideoConfig, taskRecord?: TaskRecord) {
     const exec = async (mn: `${string}:${string}`) => {
-      const [vendorId, model] = mn.split(/:(.+)/);
-      this.result = await proxyAiCall("video", vendorId, model, input);
+      const [vendorId, modelName] = mn.split(/:(.+)/);
+      this.result = await proxyAiCall("video", vendorId, modelName, input);
     };
     if (taskRecord) {
       await withTaskRecord(this.key, taskRecord.taskClass, taskRecord.describe, taskRecord.relatedObjects, taskRecord.projectId, exec);
@@ -335,8 +344,8 @@ class AiAudio {
   }
   async run(input: VideoConfig, taskRecord?: TaskRecord) {
     const exec = async (mn: `${string}:${string}`) => {
-      const [vendorId, model] = mn.split(/:(.+)/);
-      this.result = await proxyAiCall("audio", vendorId, model, input);
+      const [vendorId, modelName] = mn.split(/:(.+)/);
+      this.result = await proxyAiCall("audio", vendorId, modelName, input);
       return this;
     };
     if (taskRecord) {

@@ -1,113 +1,56 @@
 import express from "express";
 import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
-import u from "@/utils";
+import { peekToken } from "@/utils/auth";
 import { z } from "zod";
-import { transform } from "sucrase";
+
 const router = express.Router();
+const BACKEND_URL = process.env.TOONFLOW_BACKEND_URL || "http://localhost:4000";
 
-const vendorConfigSchema = z.object({
-  id: z.string(),
-  author: z.string(),
-  description: z.string().optional(),
-  name: z.string(),
-  icon: z.string().optional(),
-  inputs: z.array(
-    z.object({
-      key: z.string(),
-      label: z.string(),
-      type: z.enum(["text", "password", "url"]),
-      required: z.boolean(),
-      placeholder: z.string().optional(),
-    }),
-  ),
-  inputValues: z.record(z.string(), z.string()),
-  models: z.array(
-    z.discriminatedUnion("type", [
-      z.object({
-        name: z.string(),
-        modelName: z.string(),
-        type: z.literal("text"),
-        think: z.boolean(),
-      }),
-      z.object({
-        name: z.string(),
-        modelName: z.string(),
-        type: z.literal("image"),
-        mode: z.array(z.enum(["text", "singleImage", "multiReference"])),
-      }),
-      z.object({
-        name: z.string(),
-        modelName: z.string(),
-        type: z.literal("video"),
-        mode: z.array(
-          z.union([
-            z.enum(["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional", "text", "audioReference", "videoReference"]),
-            z.array(z.string().regex(/^(videoReference|imageReference|audioReference):\d+$/)),
-          ]),
-        ),
-        audio: z.union([z.literal("optional"), z.boolean()]),
-        durationResolutionMap: z.array(
-          z.object({
-            duration: z.array(z.number()),
-            resolution: z.array(z.string()),
-          }),
-        ),
-      }),
-    ]),
-  ),
-});
-
+// Phase 2: 契约变更
+//   旧：接收完整 vendor TS 代码（tsCode），在客户端 sandbox 验 schema 后写本地文件 +
+//       插入 o_vendorConfig。phase 1 后这套代码不再被实际执行，等同死功能。
+//   新：用户选模板（如 openai-compatible）+ 填参数（apiKey/baseUrl/models），转发后端
+//       POST /api/vendor/create。
+//
+// 旧客户端 UI 在 phase 2 前端 UI 改造完成前仍可能上传 tsCode；此时返回 410 明确告知。
 export default router.post(
   "/",
   validateFields({
-    tsCode: z.string(),
+    template: z.string().optional(),
+    id: z.string().optional(),
+    name: z.string().optional(),
+    inputValues: z.record(z.string(), z.string()).optional(),
+    models: z.array(z.any()).optional(),
+    tsCode: z.string().optional(),
   }),
   async (req, res) => {
-    const { tsCode } = req.body;
-    const jsCode = transform(tsCode, { transforms: ["typescript"] }).code;
-    const exports = u.vm(jsCode);
-    if (!exports) return res.status(400).send(success("脚本文件必须导出对象"));
-    if (!exports.textRequest) return res.status(400).send(success("脚本文件必须导出文本请求对象"));
-    if (!exports.imageRequest) return res.status(400).send(success("脚本文件必须导出图像请求对象"));
-    if (!exports.videoRequest) return res.status(400).send(success("脚本文件必须导出视频请求对象"));
-    if (!exports.vendor) return res.status(400).send(success("脚本文件必须导出vendor对象"));
-    const vendor = exports.vendor;
-    const result = vendorConfigSchema.safeParse(vendor);
-    if (!result.success) {
-      const issueLines = result.error.issues.map((issue, index) => {
-        const path = issue.path.length ? issue.path.join(".") : "root";
-        let detail = issue.message;
+    const { template, id, name, inputValues, models, tsCode } = req.body;
 
-        if (issue.code === "invalid_union") {
-          const unionDetails = [
-            ...new Set(
-              issue.errors
-                .flat()
-                .map((e) => e.message)
-                .filter(Boolean),
-            ),
-          ];
-          if (unionDetails.length > 0) {
-            detail = `${issue.message}（${unionDetails.join("；")}）`;
-          }
-        }
-        return `${index + 1}. ${path}: ${detail}`;
-      });
-
-      return res.status(400).send(error(`vendor配置校验失败，共 ${issueLines.length} 处:\n${issueLines.join("\n")}`));
+    if (tsCode && !template) {
+      return res.status(410).send(
+        error("此接口已迁移：客户端不再支持上传 vendor 代码。请通过模板（如 openai-compatible）+ 参数添加供应商。"),
+      );
+    }
+    if (!template || !id) {
+      return res.status(400).send(error("template 和 id 必填"));
     }
 
-    if ((vendor.id as string).includes(":")) return res.status(400).send(error("id不能包含英文冒号"));
-    const data = await u.db("o_vendorConfig").where("id", vendor.id).first();
-    if (data) return res.status(500).send(error("供应商id已存在"));
-    const [id] = await u.db("o_vendorConfig").insert({
-      id: vendor.id,
-      inputValues: JSON.stringify(vendor.inputValues ?? {}),
-      models: JSON.stringify([]),
-      enable: vendor.id == "toonflow" ? 1 : 0,
+    const token = peekToken();
+    const r = await fetch(`${BACKEND_URL}/api/vendor/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ template, id, name, inputValues: inputValues ?? {}, models: models ?? [] }),
     });
-    u.vendor.writeCode(vendor.id, tsCode);
-    res.status(200).send(success(result.data));
+    let json: any;
+    try {
+      json = await r.json();
+    } catch {
+      return res.status(502).send(error("vendor 服务返回非 JSON"));
+    }
+    if (!json || json.code !== 0) {
+      return res.status(r.status || 502).send(error(json?.message ?? "vendor 创建失败"));
+    }
+    res.status(200).send(success(json.data));
   },
 );
